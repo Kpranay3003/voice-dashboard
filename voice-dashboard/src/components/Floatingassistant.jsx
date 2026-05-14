@@ -1,7 +1,7 @@
 /**
  * FloatingAssistant.jsx
  * Bottom-right floating widget:
- *   🤖 Chat  — AI chatbot via Anthropic (calls /api/chat on backend)
+ *   🤖 Chat  — AI chatbot via OpenAI (calls /api/chat on backend)
  *   🎤 Voice — STT + TTS, auto-opens nodes, reads live data
  */
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -63,12 +63,12 @@ export default function FloatingAssistant({
   const synthRef       = useRef(window.speechSynthesis);
 
   /* ── chat state ── */
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      text: "👋 Hi! I'm your AI dashboard assistant powered by Claude.\n\nAsk me anything about your supply chain nodes — failures, totals, comparisons, trends, or just say \"open WMS replication\" to navigate.\n\nType **help** for examples.",
-    },
-  ]);
+  // NOTE: The greeting is display-only. It is intentionally NOT included
+  // in the messages array sent to OpenAI — OpenAI requires the first
+  // message to be from the user, not the assistant.
+  const GREETING_TEXT = "👋 Hi! I'm your AI dashboard assistant powered by OpenAI.\n\nAsk me anything about your supply chain nodes — failures, totals, comparisons, trends, or just say \"open WMS replication\" to navigate.\n\nType **help** for examples.";
+
+  const [messages, setMessages] = useState([]);   // ← starts empty; greeting is rendered separately
   const [input,       setInput]       = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const chatEndRef = useRef(null);
@@ -160,7 +160,7 @@ export default function FloatingAssistant({
     }
   };
 
-  /* ── send chat to Anthropic via backend ── */
+  /* ── send chat to OpenAI via backend ── */
   const sendChat = useCallback(async () => {
     const text = input.trim();
     if (!text || chatLoading) return;
@@ -205,33 +205,41 @@ Keep answers concise and data-driven. Use the live numbers provided above.
 If asked to open or navigate to a node, include OPEN_NODE:<node_id> in your response.`;
 
     try {
-      /* Call YOUR backend /api/chat — never call Anthropic directly from browser */
+      /* Call YOUR backend /api/chat — never call OpenAI directly from browser */
       const res = await fetch(`${BACKEND}/api/chat`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           systemPrompt,
-          messages: history.map(m => ({
-            role:    m.role === "assistant" ? "assistant" : "user",
-            content: m.text,
-          })),
+          // FIX: Only send user/assistant turns — no greeting, no assistant-first message.
+          // OpenAI will reject a conversation that starts with role: "assistant".
+          messages: history
+            .filter(m => m.role === "user" || m.role === "assistant")
+            .map(m => ({
+              role:    m.role,
+              content: m.text,
+            })),
         }),
       });
 
       const data = await res.json();
 
-      /* Handle error responses from backend or Anthropic */
+      /* FIX: data.error is a plain string from our backend, not an object.
+         Old code did data.error?.message which was always undefined → "Something went wrong." */
       if (!res.ok || data.error) {
-        const errMsg = data.detail || data.error?.message || "Something went wrong.";
+        const errMsg =
+          typeof data.error === "string"
+            ? data.error
+            : data.error?.message || data.detail || "Something went wrong.";
         setMessages(prev => [...prev, { role: "assistant", text: `⚠️ ${errMsg}` }]);
         setChatLoading(false);
         return;
       }
 
-      /* Extract text from Anthropic response */
+      /* Extract text — backend returns { content: [{ text: "..." }] } */
       const replyText = data.content?.map(c => c.text || "").join("") || "Sorry, no response.";
 
-      /* Check if Claude wants to open a node */
+      /* Check if the model wants to open a node */
       const openMatch = replyText.match(/OPEN_NODE:([^\s\n]+)/);
       if (openMatch) {
         const nodeId     = openMatch[1].trim();
@@ -244,7 +252,7 @@ If asked to open or navigate to a node, include OPEN_NODE:<node_id> in your resp
     } catch {
       setMessages(prev => [...prev, {
         role: "assistant",
-        text: "❌ Could not reach the backend.\n\nMake sure you ran:\n**python server.py**",
+        text: "❌ Could not reach the backend.\n\nMake sure you ran:\n**node server.cjs** or **python server.py**",
       }]);
     }
 
@@ -275,6 +283,15 @@ If asked to open or navigate to a node, include OPEN_NODE:<node_id> in your resp
           {tab === "chat" && (
             <div className="fa-chat">
               <div className="fa-messages">
+
+                {/* Greeting rendered as a static bubble — NOT part of API history */}
+                <div className="fa-msg fa-msg--assistant">
+                  <span className="fa-msg-avatar">🤖</span>
+                  <div className="fa-msg-bubble">
+                    <RenderText text={GREETING_TEXT} />
+                  </div>
+                </div>
+
                 {messages.map((m, i) => (
                   <div key={i} className={`fa-msg fa-msg--${m.role}`}>
                     {m.role === "assistant" && <span className="fa-msg-avatar">🤖</span>}
