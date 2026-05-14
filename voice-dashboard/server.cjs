@@ -2,25 +2,35 @@ const express = require("express");
 const XLSX    = require("xlsx");
 const cors    = require("cors");
 const https   = require("https");
+require("dotenv").config();   // ← reads your .env file automatically
+
+// ── Corporate SSL proxy fix ──────────────────────────────────
+// Many company networks use SSL inspection (a proxy that intercepts
+// HTTPS traffic). Node.js rejects this with "unable to get local
+// issuer certificate". This tells Node.js to trust the proxy's cert.
+// Safe to use inside a corporate network — remove if deploying publicly.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ────────────────────────────────────────────────────────────
-//  PUT YOUR OPENAI API KEY HERE
-//  Get it from: https://platform.openai.com/api-keys
-//  It looks like: sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx
+//  API key is loaded from your .env file — do NOT paste it here
+//  In your .env file, add this line (no quotes):
+//    OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx
+//  Get your key from: https://platform.openai.com/api-keys
 // ────────────────────────────────────────────────────────────
-const OPENAI_API_KEY = "API_KEY";
-// ────────────────────────────────────────────────────────────
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Warn if key not set
-if (!OPENAI_API_KEY || OPENAI_API_KEY.includes("paste-your")) {
-  console.warn("⚠️  WARNING: OpenAI API key not set in server.cjs!");
-  console.warn("   Edit server.cjs and replace the placeholder key.");
+// Validate key at startup
+if (!OPENAI_API_KEY) {
+  console.warn("⚠️  WARNING: OPENAI_API_KEY is missing from your .env file!");
+  console.warn("   Add this line to .env:  OPENAI_API_KEY=sk-proj-your-key-here");
+} else if (!OPENAI_API_KEY.startsWith("sk-")) {
+  console.warn("⚠️  WARNING: OPENAI_API_KEY looks invalid (should start with sk-)");
 } else {
-  console.log("✅ OpenAI API key loaded.");
+  console.log("✅ OpenAI API key loaded from .env");
 }
 
 // ── Load Excel once at startup ───────────────────────────────
@@ -53,7 +63,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     status:  "ok",
     sheets:  workbook.SheetNames,
-    api_key: OPENAI_API_KEY.includes("paste-your") ? "NOT SET ⚠️" : "set ✅",
+    api_key: OPENAI_API_KEY ? "set ✅" : "NOT SET ⚠️",
   });
 });
 
@@ -65,9 +75,9 @@ app.post("/api/chat", (req, res) => {
     return res.status(400).json({ error: "messages array required" });
   }
 
-  if (!OPENAI_API_KEY || OPENAI_API_KEY.includes("paste-your")) {
+  if (!OPENAI_API_KEY) {
     return res.status(500).json({
-      error: "OpenAI API key not set. Edit server.cjs and add your key."
+      error: "OpenAI API key not set. Add OPENAI_API_KEY to your .env file."
     });
   }
 
@@ -78,9 +88,9 @@ app.post("/api/chat", (req, res) => {
   ];
 
   const body = JSON.stringify({
-    model:       "gpt-4o-mini",   // fast + cheap, change to "gpt-4o" for smarter
-    max_tokens:  1024,
-    messages:    openAIMessages,
+    model:      "gpt-4o-mini",  // fast + cheap; change to "gpt-4o" for smarter responses
+    max_tokens: 1024,
+    messages:   openAIMessages,
   });
 
   const options = {
@@ -88,8 +98,8 @@ app.post("/api/chat", (req, res) => {
     path:     "/v1/chat/completions",
     method:   "POST",
     headers: {
-      "Content-Type":  "application/json",
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,  // ← OpenAI uses Bearer token
+      "Content-Type":   "application/json",
+      "Authorization":  `Bearer ${OPENAI_API_KEY}`,
       "Content-Length": Buffer.byteLength(body),
     },
   };
@@ -101,19 +111,18 @@ app.post("/api/chat", (req, res) => {
       try {
         const parsed = JSON.parse(data);
 
-        // OpenAI error (wrong key, quota, etc.)
+        // OpenAI returned an error (wrong key, quota exceeded, etc.)
         if (parsed.error) {
+          console.error("OpenAI error:", parsed.error.message);
           return res.status(apiRes.statusCode).json({ error: parsed.error.message });
         }
 
-        // Convert OpenAI response format → send to frontend
-        // OpenAI: parsed.choices[0].message.content
-        // We wrap it to match what FloatingAssistant.jsx expects
+        // Wrap response to match what FloatingAssistant.jsx expects
         res.json({
           content: [{ text: parsed.choices?.[0]?.message?.content || "No response." }]
         });
 
-      } catch {
+      } catch (e) {
         res.status(500).json({ error: "Failed to parse OpenAI response", raw: data });
       }
     });
