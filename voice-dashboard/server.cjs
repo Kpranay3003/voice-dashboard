@@ -2,13 +2,9 @@ const express = require("express");
 const XLSX    = require("xlsx");
 const cors    = require("cors");
 const https   = require("https");
-require("dotenv").config();   // ← reads your .env file automatically
+require("dotenv").config();
 
 // ── Corporate SSL proxy fix ──────────────────────────────────
-// Many company networks use SSL inspection (a proxy that intercepts
-// HTTPS traffic). Node.js rejects this with "unable to get local
-// issuer certificate". This tells Node.js to trust the proxy's cert.
-// Safe to use inside a corporate network — remove if deploying publicly.
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const app = express();
@@ -16,21 +12,34 @@ app.use(cors());
 app.use(express.json());
 
 // ────────────────────────────────────────────────────────────
-//  API key is loaded from your .env file — do NOT paste it here
-//  In your .env file, add this line (no quotes):
-//    OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx
-//  Get your key from: https://platform.openai.com/api-keys
+//  All config lives in .env — never hardcode values here
+//
+//  MINIMUM required in .env:
+//    OPENAI_API_KEY=your-key-here
+//
+//  If your lab uses a custom gateway, also add:
+//    OPENAI_BASE_URL=https://your-lab-gateway.com/v1
+//    OPENAI_MODEL=gpt-4o
+//
+//  If no OPENAI_BASE_URL is set, defaults to real OpenAI.
 // ────────────────────────────────────────────────────────────
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+// Parse hostname and path out of the base URL
+const parsedUrl    = new URL(OPENAI_BASE_URL);
+const API_HOSTNAME = parsedUrl.hostname;
+const API_PORT     = parsedUrl.port ? Number(parsedUrl.port) : 443;
+const API_PREFIX   = parsedUrl.pathname.replace(/\/$/, "");
 
 // Validate key at startup
 if (!OPENAI_API_KEY) {
-  console.warn("⚠️  WARNING: OPENAI_API_KEY is missing from your .env file!");
-  console.warn("   Add this line to .env:  OPENAI_API_KEY=sk-proj-your-key-here");
-} else if (!OPENAI_API_KEY.startsWith("sk-")) {
-  console.warn("⚠️  WARNING: OPENAI_API_KEY looks invalid (should start with sk-)");
+  console.warn("WARNING: OPENAI_API_KEY is missing from your .env file!");
 } else {
-  console.log("✅ OpenAI API key loaded from .env");
+  console.log("OpenAI API key loaded from .env");
+  console.log("Endpoint : " + OPENAI_BASE_URL + "/chat/completions");
+  console.log("Model    : " + OPENAI_MODEL);
 }
 
 // ── Load Excel once at startup ───────────────────────────────
@@ -61,13 +70,15 @@ app.get("/api/summary/:nodeId", (req, res) => {
 // ── GET /api/health ──────────────────────────────────────────
 app.get("/api/health", (req, res) => {
   res.json({
-    status:  "ok",
-    sheets:  workbook.SheetNames,
-    api_key: OPENAI_API_KEY ? "set ✅" : "NOT SET ⚠️",
+    status:   "ok",
+    sheets:   workbook.SheetNames,
+    api_key:  OPENAI_API_KEY ? "set" : "NOT SET",
+    endpoint: OPENAI_BASE_URL + "/chat/completions",
+    model:    OPENAI_MODEL,
   });
 });
 
-// ── POST /api/chat (proxies to OpenAI) ───────────────────────
+// ── POST /api/chat ───────────────────────────────────────────
 app.post("/api/chat", (req, res) => {
   const { messages, systemPrompt } = req.body;
 
@@ -81,25 +92,25 @@ app.post("/api/chat", (req, res) => {
     });
   }
 
-  // OpenAI expects system message as first item in messages array
   const openAIMessages = [
     { role: "system", content: systemPrompt || "You are a helpful assistant." },
     ...messages.map(m => ({ role: m.role, content: m.content })),
   ];
 
   const body = JSON.stringify({
-    model:      "gpt-4o-mini",  // fast + cheap; change to "gpt-4o" for smarter responses
+    model:      OPENAI_MODEL,
     max_tokens: 1024,
     messages:   openAIMessages,
   });
 
   const options = {
-    hostname: "api.openai.com",
-    path:     "/v1/chat/completions",
+    hostname: API_HOSTNAME,
+    port:     API_PORT,
+    path:     API_PREFIX + "/chat/completions",
     method:   "POST",
     headers: {
       "Content-Type":   "application/json",
-      "Authorization":  `Bearer ${OPENAI_API_KEY}`,
+      "Authorization":  "Bearer " + OPENAI_API_KEY,
       "Content-Length": Buffer.byteLength(body),
     },
   };
@@ -110,26 +121,21 @@ app.post("/api/chat", (req, res) => {
     apiRes.on("end", () => {
       try {
         const parsed = JSON.parse(data);
-
-        // OpenAI returned an error (wrong key, quota exceeded, etc.)
         if (parsed.error) {
-          console.error("OpenAI error:", parsed.error.message);
+          console.error("API error:", parsed.error.message);
           return res.status(apiRes.statusCode).json({ error: parsed.error.message });
         }
-
-        // Wrap response to match what FloatingAssistant.jsx expects
         res.json({
           content: [{ text: parsed.choices?.[0]?.message?.content || "No response." }]
         });
-
       } catch (e) {
-        res.status(500).json({ error: "Failed to parse OpenAI response", raw: data });
+        res.status(500).json({ error: "Failed to parse API response", raw: data });
       }
     });
   });
 
   apiReq.on("error", (e) => {
-    res.status(500).json({ error: "Request to OpenAI failed: " + e.message });
+    res.status(500).json({ error: "Request to API failed: " + e.message });
   });
 
   apiReq.write(body);
@@ -137,6 +143,6 @@ app.post("/api/chat", (req, res) => {
 });
 
 app.listen(5000, () => {
-  console.log("✅ Server running on http://localhost:5000");
-  console.log("   Health check: http://localhost:5000/api/health");
+  console.log("Server running on http://localhost:5000");
+  console.log("Health check: http://localhost:5000/api/health");
 });
