@@ -1,148 +1,131 @@
-const express = require("express");
-const XLSX    = require("xlsx");
-const cors    = require("cors");
-const https   = require("https");
-require("dotenv").config();
+"""
+server.py  —  Rapid Dashboard Backend (Python + FastAPI)
 
-// ── Corporate SSL proxy fix ──────────────────────────────────
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+PERFORMANCE FIX:
+  All Excel sheets are read ONCE at startup and cached as plain
+  Python dicts in memory. Every API request is then just a
+  dictionary lookup — no file I/O, no XML parsing per request.
+  This matches the speed of the original JavaScript backend.
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+Install:
+    pip install fastapi uvicorn[standard] openpyxl
 
-// ────────────────────────────────────────────────────────────
-//  All config lives in .env — never hardcode values here
-//
-//  MINIMUM required in .env:
-//    OPENAI_API_KEY=your-key-here
-//
-//  If your lab uses a custom gateway, also add:
-//    OPENAI_BASE_URL=https://your-lab-gateway.com/v1
-//    OPENAI_MODEL=gpt-4o
-//
-//  If no OPENAI_BASE_URL is set, defaults to real OpenAI.
-// ────────────────────────────────────────────────────────────
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
-const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-const OPENAI_MODEL    = process.env.OPENAI_MODEL || "gpt-4o-mini";
+Run:
+    python server.py
+"""
 
-// Parse hostname and path out of the base URL
-const parsedUrl    = new URL(OPENAI_BASE_URL);
-const API_HOSTNAME = parsedUrl.hostname;
-const API_PORT     = parsedUrl.port ? Number(parsedUrl.port) : 443;
-const API_PREFIX   = parsedUrl.pathname.replace(/\/$/, "");
+import openpyxl
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-// Validate key at startup
-if (!OPENAI_API_KEY) {
-  console.warn("WARNING: OPENAI_API_KEY is missing from your .env file!");
-} else {
-  console.log("OpenAI API key loaded from .env");
-  console.log("Endpoint : " + OPENAI_BASE_URL + "/chat/completions");
-  console.log("Model    : " + OPENAI_MODEL);
-}
+# ════════════════════════════════════════════════════════════
+#  STARTUP — read entire Excel into memory once
+# ════════════════════════════════════════════════════════════
+EXCEL_PATH = "data.xlsx"
 
-// ── Load Excel once at startup ───────────────────────────────
-const workbook = XLSX.readFile("data.xlsx");
+# This dict holds ALL sheet data as plain Python lists of dicts
+# Structure: { "sheet_name": [ {col: val, ...}, ... ] }
+SHEET_CACHE: dict[str, list[dict]] = {}
 
-const getSheetData = (sheetName) => {
-  const sheet = workbook.Sheets[sheetName];
-  if (!sheet) return [];
-  return XLSX.utils.sheet_to_json(sheet);
-};
+def load_excel_to_cache():
+    print(f"📂 Loading {EXCEL_PATH} into memory...")
+    try:
+        wb = openpyxl.load_workbook(EXCEL_PATH, read_only=True, data_only=True)
+    except FileNotFoundError:
+        print(f"❌ ERROR: {EXCEL_PATH} not found. Place it next to server.py")
+        return
 
-// ── GET /api/node/:nodeId ────────────────────────────────────
-app.get("/api/node/:nodeId", (req, res) => {
-  const data = getSheetData(req.params.nodeId);
-  res.json(data);
-});
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        rows  = list(sheet.iter_rows(values_only=True))
 
-// ── GET /api/summary/:nodeId ─────────────────────────────────
-app.get("/api/summary/:nodeId", (req, res) => {
-  const data     = getSheetData(req.params.nodeId);
-  const total    = data.length;
-  const success  = data.filter(d => d.Status === "SUCCESS").length;
-  const failed   = data.filter(d => d.Status === "FAILED").length;
-  const critical = data.filter(d => d.CRITICAL === "YES").length;
-  res.json({ total, success, failed, critical });
-});
+        if not rows:
+            SHEET_CACHE[sheet_name] = []
+            continue
 
-// ── GET /api/health ──────────────────────────────────────────
-app.get("/api/health", (req, res) => {
-  res.json({
-    status:   "ok",
-    sheets:   workbook.SheetNames,
-    api_key:  OPENAI_API_KEY ? "set" : "NOT SET",
-    endpoint: OPENAI_BASE_URL + "/chat/completions",
-    model:    OPENAI_MODEL,
-  });
-});
+        # First row = headers
+        headers = [
+            str(h).strip() if h is not None else f"col_{i}"
+            for i, h in enumerate(rows[0])
+        ]
 
-// ── POST /api/chat ───────────────────────────────────────────
-app.post("/api/chat", (req, res) => {
-  const { messages, systemPrompt } = req.body;
+        records = []
+        for row in rows[1:]:
+            if all(v is None for v in row):
+                continue  # skip blank rows
+            records.append({
+                headers[i]: (str(v) if v is not None else "")
+                for i, v in enumerate(row)
+            })
 
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "messages array required" });
-  }
+        SHEET_CACHE[sheet_name] = records
+        print(f"   ✅ '{sheet_name}' — {len(records):,} rows cached")
 
-  if (!OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "OpenAI API key not set. Add OPENAI_API_KEY to your .env file."
-    });
-  }
+    wb.close()
+    print(f"🚀 All sheets loaded. Serving from memory.\n")
 
-  const openAIMessages = [
-    { role: "system", content: systemPrompt || "You are a helpful assistant." },
-    ...messages.map(m => ({ role: m.role, content: m.content })),
-  ];
+# Load immediately at module import (before first request)
+load_excel_to_cache()
 
-  const body = JSON.stringify({
-    model:      OPENAI_MODEL,
-    max_tokens: 1024,
-    messages:   openAIMessages,
-  });
 
-  const options = {
-    hostname: API_HOSTNAME,
-    port:     API_PORT,
-    path:     API_PREFIX + "/chat/completions",
-    method:   "POST",
-    headers: {
-      "Content-Type":   "application/json",
-      "Authorization":  "Bearer " + OPENAI_API_KEY,
-      "Content-Length": Buffer.byteLength(body),
-    },
-  };
+# ════════════════════════════════════════════════════════════
+#  FASTAPI APP
+# ════════════════════════════════════════════════════════════
+app = FastAPI(title="Rapid Dashboard API")
 
-  const apiReq = https.request(options, (apiRes) => {
-    let data = "";
-    apiRes.on("data", chunk => { data += chunk; });
-    apiRes.on("end", () => {
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.error) {
-          console.error("API error:", parsed.error.message);
-          return res.status(apiRes.statusCode).json({ error: parsed.error.message });
-        }
-        res.json({
-          content: [{ text: parsed.choices?.[0]?.message?.content || "No response." }]
-        });
-      } catch (e) {
-        res.status(500).json({ error: "Failed to parse API response", raw: data });
-      }
-    });
-  });
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  apiReq.on("error", (e) => {
-    res.status(500).json({ error: "Request to API failed: " + e.message });
-  });
 
-  apiReq.write(body);
-  apiReq.end();
-});
+# ── GET /api/node/{node_id} ──────────────────────────────────
+# Returns all rows for a sheet — served from cache, instant
+@app.get("/api/node/{node_id}")
+def get_node_data(node_id: str):
+    return SHEET_CACHE.get(node_id, [])
 
-app.listen(5000, () => {
-  console.log("Server running on http://localhost:5000");
-  console.log("Health check: http://localhost:5000/api/health");
-});
+
+# ── GET /api/summary/{node_id} ───────────────────────────────
+# Returns total/success/failed counts — served from cache, instant
+@app.get("/api/summary/{node_id}")
+def get_summary(node_id: str):
+    data = SHEET_CACHE.get(node_id, [])
+
+    total    = len(data)
+    success  = sum(1 for d in data if d.get("Status", "").upper() == "SUCCESS")
+    failed   = sum(1 for d in data if d.get("Status", "").upper() == "FAILED")
+    critical = sum(1 for d in data if d.get("CRITICAL", "").upper() == "YES")
+
+    return {
+        "total":    total,
+        "success":  success,
+        "failed":   failed,
+        "critical": critical,
+    }
+
+
+# ── GET /api/health ──────────────────────────────────────────
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "excel":  EXCEL_PATH,
+        "sheets": [
+            {"name": name, "rows": len(rows)}
+            for name, rows in SHEET_CACHE.items()
+        ],
+    }
+
+
+# ── Run ──────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=False)
+    #                                                      ^^^^^^^^^^^
+    # reload=False is important for performance —
+    # reload=True watches files and re-imports the module,
+    # which means re-reading the Excel on every code change.
+    # Turn it True only when actively editing server.py.
